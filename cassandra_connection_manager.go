@@ -22,6 +22,17 @@ type CassandraConnectionManager struct {
 
 var _ storage.ConnectionManager[*gocql.Session] = &CassandraConnectionManager{}
 
+// cassandraCreateSession 默认创建真实会话，测试可替换。空主机列表返回 ErrNoHosts，不触网。
+// cassandraCloseSession 单独包一层：未初始化的会话 Close 会在内部锁上 panic。
+var (
+	cassandraCreateSession = func(cluster *gocql.ClusterConfig) (*gocql.Session, error) {
+		return cluster.CreateSession()
+	}
+	cassandraCloseSession = func(session *gocql.Session) {
+		session.Close()
+	}
+)
+
 // NewCassandraConnectionManagerFromConfig 从配置创建
 func NewCassandraConnectionManagerFromConfig(hosts []string, keyspace string) *CassandraConnectionManager {
 	return &CassandraConnectionManager{
@@ -55,7 +66,7 @@ func (x *CassandraConnectionManager) Take(ctx context.Context) (*gocql.Session, 
 	cluster.Keyspace = x.Keyspace
 	cluster.Consistency = gocql.Quorum
 
-	session, err := cluster.CreateSession()
+	session, err := cassandraCreateSession(cluster)
 	if err != nil {
 		return nil, err
 	}
@@ -73,7 +84,7 @@ func (x *CassandraConnectionManager) Shutdown(ctx context.Context) error {
 	x.initMu.Lock()
 	defer x.initMu.Unlock()
 	if x.session != nil {
-		x.session.Close()
+		cassandraCloseSession(x.session)
 	}
 	x.session = nil
 	x.initialized = false

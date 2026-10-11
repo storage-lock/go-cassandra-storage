@@ -21,6 +21,27 @@ type CassandraStorage struct {
 
 var _ storage.Storage = &CassandraStorage{}
 
+// 查询默认走真实会话。Session 没有可替换的查询接口，测试通过替换这些函数覆盖分支。
+var (
+	cassandraExec = func(session *gocql.Session, query string) error {
+		return session.Query(query).Exec()
+	}
+	cassandraScanCAS = func(session *gocql.Session, ctx context.Context, query string, args ...any) (bool, error) {
+		return session.Query(query, args...).WithContext(ctx).ScanCAS()
+	}
+	cassandraScan = func(session *gocql.Session, ctx context.Context, query string, args []any, dest ...any) error {
+		return session.Query(query, args...).WithContext(ctx).Scan(dest...)
+	}
+	cassandraIter = func(session *gocql.Session, ctx context.Context, query string) cassandraIterator {
+		return session.Query(query).WithContext(ctx).Iter()
+	}
+)
+
+type cassandraIterator interface {
+	Scan(dest ...any) bool
+	Close() error
+}
+
 func NewCassandraStorage(ctx context.Context, options *CassandraStorageOptions) (*CassandraStorage, error) {
 	if err := options.Check(); err != nil {
 		return nil, err
@@ -43,7 +64,12 @@ func (x *CassandraStorage) Capabilities() []storage.StorageCapability {
 		storage.CapabilityCAS,
 		storage.CapabilityReliableTime,
 		storage.CapabilityAtomicDelete,
+		storage.CapabilityWatch,
 	}
+}
+
+func (x *CassandraStorage) Watch(ctx context.Context, lockId string) (<-chan *storage.LockInformation, error) {
+	return storage.NewPollingLockWatcher(x, 500*time.Millisecond).Watch(ctx, lockId)
 }
 
 func (x *CassandraStorage) Init(ctx context.Context) error {
@@ -59,7 +85,7 @@ func (x *CassandraStorage) Init(ctx context.Context) error {
 		version bigint,
 		json_data text
 	)`, x.options.Keyspace, x.options.TableName)
-	if err := x.session.Query(query).Exec(); err != nil {
+	if err := cassandraExec(x.session, query); err != nil {
 		return err
 	}
 
@@ -81,7 +107,7 @@ func (p *LocalTimeProvider) GetTime(ctx context.Context) (time.Time, error) {
 func (x *CassandraStorage) CreateWithVersion(ctx context.Context, lockId string, version storage.Version, lockInformation *storage.LockInformation) error {
 	query := fmt.Sprintf(`INSERT INTO %s.%s (lock_id, version, json_data) VALUES (?, ?, ?) IF NOT EXISTS`,
 		x.options.Keyspace, x.options.TableName)
-	applied, err := x.session.Query(query, lockId, int64(version), lockInformation.ToJsonString()).WithContext(ctx).ScanCAS()
+	applied, err := cassandraScanCAS(x.session, ctx, query, lockId, int64(version), lockInformation.ToJsonString())
 	if err != nil {
 		return err
 	}
@@ -95,7 +121,7 @@ func (x *CassandraStorage) CreateWithVersion(ctx context.Context, lockId string,
 func (x *CassandraStorage) UpdateWithVersion(ctx context.Context, lockId string, expectedVersion, newVersion storage.Version, lockInformation *storage.LockInformation) error {
 	query := fmt.Sprintf(`UPDATE %s.%s SET version = ?, json_data = ? WHERE lock_id = ? IF version = ?`,
 		x.options.Keyspace, x.options.TableName)
-	applied, err := x.session.Query(query, int64(newVersion), lockInformation.ToJsonString(), lockId, int64(expectedVersion)).WithContext(ctx).ScanCAS()
+	applied, err := cassandraScanCAS(x.session, ctx, query, int64(newVersion), lockInformation.ToJsonString(), lockId, int64(expectedVersion))
 	if err != nil {
 		return err
 	}
@@ -109,7 +135,7 @@ func (x *CassandraStorage) UpdateWithVersion(ctx context.Context, lockId string,
 func (x *CassandraStorage) DeleteWithVersion(ctx context.Context, lockId string, expectedVersion storage.Version, lockInformation *storage.LockInformation) error {
 	query := fmt.Sprintf(`DELETE FROM %s.%s WHERE lock_id = ? IF version = ?`,
 		x.options.Keyspace, x.options.TableName)
-	applied, err := x.session.Query(query, lockId, int64(expectedVersion)).WithContext(ctx).ScanCAS()
+	applied, err := cassandraScanCAS(x.session, ctx, query, lockId, int64(expectedVersion))
 	if err != nil {
 		return err
 	}
@@ -124,7 +150,7 @@ func (x *CassandraStorage) Get(ctx context.Context, lockId string) (string, erro
 		x.options.Keyspace, x.options.TableName)
 	var version int64
 	var jsonData string
-	if err := x.session.Query(query, lockId).WithContext(ctx).Scan(&version, &jsonData); err != nil {
+	if err := cassandraScan(x.session, ctx, query, []any{lockId}, &version, &jsonData); err != nil {
 		if err == gocql.ErrNotFound {
 			return "", storage_lock.ErrLockNotFound
 		}
@@ -144,7 +170,7 @@ func (x *CassandraStorage) Close(ctx context.Context) error {
 
 func (x *CassandraStorage) List(ctx context.Context) (go_iterator.Iterator[*storage.LockInformation], error) {
 	query := fmt.Sprintf(`SELECT json_data FROM %s.%s`, x.options.Keyspace, x.options.TableName)
-	iter := x.session.Query(query).WithContext(ctx).Iter()
+	iter := cassandraIter(x.session, ctx, query)
 
 	slice := make([]*storage.LockInformation, 0)
 	var jsonData string
