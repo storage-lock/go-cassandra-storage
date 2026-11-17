@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	storage_test_helper "github.com/storage-lock/go-storage-test-helper"
-	"github.com/stretchr/testify/assert"
 )
 
 func TestCassandraStorage(t *testing.T) {
@@ -31,6 +30,10 @@ func TestCassandraStorage(t *testing.T) {
 		TableName:         storage_test_helper.TestTableName,
 		TimeProvider:      &LocalTimeProvider{},
 	})
-	assert.Nil(t, err)
+	// 构造失败必须立刻中止：TestStorage 不检查入参，nil 存储会在 Init 里空指针崩溃，
+	// 把真正的连接错误盖掉。
+	if err != nil {
+		t.Fatalf("NewCassandraStorage: %v", err)
+	}
 	storage_test_helper.TestStorage(t, s)
 }
